@@ -29,7 +29,7 @@ class State(TypedDict):
     thumbnail_sketches: Annotated[list[str], operator.add]
     final_summary: str
     user_feedback: str
-    chosen_prompt: str
+    chosen_thumbnail: str
 
 
 def extract_audio(state: State):
@@ -251,58 +251,71 @@ def human_feedback(state: State):
         }
     )
     user_feedback = answer["user_feedback"]
-    chosen_prompt = answer["chosen_prompt"]
+    chosen_thumbnail_index = answer["chosen_thumbnail"]
     return {
         "user_feedback": user_feedback,
-        "chosen_prompt": state["thumbnail_prompts"][chosen_prompt - 1],
+        "chosen_thumbnail": state["thumbnail_sketches"][chosen_thumbnail_index - 1],
     }
 
 
 def generate_hd_thumbnail(state: State):
 
-    chosen_prompt = state["chosen_prompt"]
+    chosen_thumbnail = state["chosen_thumbnail"]
     user_feedback = state["user_feedback"]
 
-    prompt = f"""
-    You are a professional YouTube thumbnail designer. Take this original thumbnail prompt and create an enhanced version that incorporates the user's specific feedback.
+    # 1. 선택한 썸네일 로드
+    with open(chosen_thumbnail, "rb") as img_file:
+        image_data = img_file.read()
 
-    ORIGINAL PROMPT:
-    {chosen_prompt}
+    # 2. 최종 썸네일 프롬프트 생성
+    final_thumbnail_prompt = f"""
+    You are a professional YouTube thumbnail designer. Enhance this thumbnail based on user feedback.
 
-    USER FEEDBACK TO INCORPORATE:
+    USER FEEDBACK:
     {user_feedback}
 
-    Create an enhanced prompt that:
-        1. Maintains the core concept from the original prompt
-        2. Specifically addresses and implements the user's feedback requests
-        3. Adds professional YouTube thumbnail specifications:
-            - High contrast and bold visual elements
-            - Clear focal points that draw the eye
-            - Professional lighting and composition
-            - Optimal text placement and readability with generous padding from edges
-            - Colors that pop and grab attention
-            - Elements that work well at small thumbnail sizes
-            - IMPORTANT: Always ensure adequate white space/padding between any text and the image borders
+    Create a high-quality final thumbnail that:
+    - Maintains the core visual elements and composition from the original image
+    - Implements the user's specific feedback requests
+    - Adds professional enhancements:
+        * High contrast and bold visual elements
+        * Clear focal points that draw the eye
+        * Professional lighting and composition
+        * Optimal text placement with generous padding from edges
+        * Colors that pop and grab attention
+        * Works well at small thumbnail sizes
+        * Adequate white space/padding between text and image borders
     """
 
-    response = llm.invoke(prompt)
-
-    final_thumbnail_prompt = response.content
-
-    client = OpenAI()
-
-    result = client.images.generate(
-        model="gpt-image-1",
-        prompt=final_thumbnail_prompt,
-        quality="high",
-        moderation="low",
-        size="auto",
+    # 3. Gemini 2.5 Flash Image로 최종 썸네일 생성
+    response = gemini_client.models.generate_content(
+        model="gemini-2.5-flash-image",
+        contents=[
+            Content(
+                parts=[
+                    Part(text=final_thumbnail_prompt),
+                    Part(inline_data={"mime_type": "image/png", "data": base64.b64encode(image_data).decode()}),
+                ]
+            )
+        ],
     )
 
-    image_bytes = base64.b64decode(result.data[0].b64_json)
+    # 4. 최종 이미지 저장
+    filename = "thumbnail_final.png"
 
-    with open("thumbnail_final.jpg", "wb") as file:
-        file.write(image_bytes)
+    if hasattr(response, 'candidates') and response.candidates:
+        candidate = response.candidates[0]
+
+        for part in candidate.content.parts:
+            if hasattr(part, 'inline_data') and part.inline_data:
+                if isinstance(part.inline_data.data, bytes):
+                    image_bytes = part.inline_data.data
+                else:
+                    image_bytes = base64.b64decode(part.inline_data.data)
+
+                with open(filename, "wb") as file:
+                    file.write(image_bytes)
+                break
 
 
 graph_builder = StateGraph(State)
