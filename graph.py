@@ -8,14 +8,20 @@ from langchain.chat_models import init_chat_model
 from typing_extensions import Annotated
 import operator
 import base64
+import random
+import os
+from google.genai import Client
+from google.genai.types import Part, Content
 
 llm = init_chat_model("openai:gpt-4o-mini")
+gemini_client = Client(api_key=os.getenv("GOOGLE_API_KEY"))
 
 
 class State(TypedDict):
 
     video_file: str
     audio_file: str
+    screenshots: list[str]
     whisper_prompt: str
     transcription: str
     summaries: Annotated[list[str], operator.add]
@@ -40,6 +46,50 @@ def extract_audio(state: State):
     subprocess.run(command)
     return {
         "audio_file": output_file,
+    }
+
+
+def extract_screenshots(state: State):
+    # 1. FFprobe로 영상 길이 확인
+    duration_cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        state["video_file"],
+    ]
+    result = subprocess.run(duration_cmd, capture_output=True, text=True)
+    duration = float(result.stdout.strip())
+
+    # 2. 랜덤 타임스탬프 생성 (5장)
+    num_screenshots = 5
+    timestamps = sorted(random.sample(range(1, int(duration) - 1), num_screenshots))
+
+    # 3. 각 타임스탬프에서 스크린샷 추출
+    screenshot_files = []
+    for i, ts in enumerate(timestamps):
+        output_file = f"screenshot_{i+1}.jpg"
+        cmd = [
+            "ffmpeg",
+            "-ss",
+            str(ts),
+            "-i",
+            state["video_file"],
+            "-frames:v",
+            "1",
+            "-q:v",
+            "2",
+            "-y",
+            output_file,
+        ]
+        subprocess.run(cmd)
+        screenshot_files.append(output_file)
+
+    return {
+        "screenshots": screenshot_files,
     }
 
 
@@ -122,6 +172,7 @@ def dispatch_artists(state: State):
             {
                 "id": i,
                 "summary": state["final_summary"],
+                "screenshots": state["screenshots"],
             },
         )
         for i in [1, 2, 3, 4, 5]
@@ -131,39 +182,60 @@ def dispatch_artists(state: State):
 def generate_thumbnails(args):
     concept_id = args["id"]
     summary = args["summary"]
+    screenshots = args["screenshots"]
 
-    prompt = f"""
-    Based on this video summary, create a detailed visual prompt for a YouTube thumbnail.
+    # 1. 스크린샷 선택 및 로드
+    selected_screenshot = screenshots[concept_id % len(screenshots)]
 
-    Create a detailed prompt for generating a thumbnail image that would attract viewers. Include:
-        - Main visual elements
-        - Color scheme
-        - Text overlay suggestions
-        - Overall composition
-    
-    Summary: {summary}
+    with open(selected_screenshot, "rb") as img_file:
+        image_data = img_file.read()
+
+    # 2. 썸네일 프롬프트 생성
+    thumbnail_prompt = f"""
+    Create a professional YouTube thumbnail based on this image from the video.
+
+    Video Summary: {summary}
+
+    Transform this screenshot into an eye-catching thumbnail:
+    - Keep the main visual elements and composition from the original image
+    - Enhance colors to make them pop and grab attention
+    - Add bold, readable text overlays with generous padding from edges
+    - Apply professional effects like subtle vignetting or sharpening
+    - Ensure it works well at small sizes
+    - Make it click-worthy while staying true to the video content
     """
 
-    response = llm.invoke(prompt)
-
-    thumbnail_prompt = response.content
-
-    client = OpenAI()
-
-    result = client.images.generate(
-        model="gpt-image-1",
-        prompt=thumbnail_prompt,
-        quality="low",
-        moderation="low",
-        size="auto",
+    # 3. Gemini 2.5 Flash Image로 썸네일 생성
+    response = gemini_client.models.generate_content(
+        model="gemini-2.5-flash-image",
+        contents=[
+            Content(
+                parts=[
+                    Part(text=thumbnail_prompt),
+                    Part(inline_data={"mime_type": "image/jpeg", "data": base64.b64encode(image_data).decode()}),
+                ]
+            )
+        ],
     )
 
-    image_bytes = base64.b64decode(result.data[0].b64_json)
+    # 4. 생성된 이미지 저장
+    filename = f"thumbnail_{concept_id}.png"
 
-    filename = f"thumbnail_{concept_id}.jpg"
+    if hasattr(response, 'candidates') and response.candidates:
+        candidate = response.candidates[0]
 
-    with open(filename, "wb") as file:
-        file.write(image_bytes)
+        for part in candidate.content.parts:
+            # inline_data로 접근
+            if hasattr(part, 'inline_data') and part.inline_data:
+                # Gemini는 bytes로 반환
+                if isinstance(part.inline_data.data, bytes):
+                    image_bytes = part.inline_data.data
+                else:
+                    image_bytes = base64.b64decode(part.inline_data.data)
+
+                with open(filename, "wb") as file:
+                    file.write(image_bytes)
+                break
 
     return {
         "thumbnail_prompts": [thumbnail_prompt],
@@ -236,6 +308,7 @@ def generate_hd_thumbnail(state: State):
 graph_builder = StateGraph(State)
 
 graph_builder.add_node("extract_audio", extract_audio)
+graph_builder.add_node("extract_screenshots", extract_screenshots)
 graph_builder.add_node("get_transcription_prompt", get_transcription_prompt)
 graph_builder.add_node("transcribe_audio", transcribe_audio)
 graph_builder.add_node("summarize_chunk", summarize_chunk)
@@ -245,7 +318,8 @@ graph_builder.add_node("human_feedback", human_feedback)
 graph_builder.add_node("generate_hd_thumbnail", generate_hd_thumbnail)
 
 graph_builder.add_edge(START, "extract_audio")
-graph_builder.add_edge("extract_audio", "get_transcription_prompt")
+graph_builder.add_edge("extract_audio", "extract_screenshots")
+graph_builder.add_edge("extract_screenshots", "get_transcription_prompt")
 graph_builder.add_edge("get_transcription_prompt", "transcribe_audio")
 graph_builder.add_conditional_edges(
     "transcribe_audio", dispatch_summarizers, ["summarize_chunk"]
