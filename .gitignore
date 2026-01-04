@@ -22,3 +22,4 @@ wheels/
 *.m4v
 *.mov
 *.avi
+.langgraph_api

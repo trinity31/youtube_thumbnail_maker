@@ -16,6 +16,7 @@ class State(TypedDict):
 
     video_file: str
     audio_file: str
+    whisper_prompt: str
     transcription: str
     summaries: Annotated[list[str], operator.add]
     thumbnail_prompts: Annotated[list[str], operator.add]
@@ -42,6 +43,17 @@ def extract_audio(state: State):
     }
 
 
+def get_transcription_prompt(state: State):
+    answer = interrupt(
+        {
+            "whisper_prompt": "전사를 위한 Whisper 프롬프트를 입력하세요 (비디오 주제 관련 키워드, 쉼표로 구분)"
+        }
+    )
+    return {
+        "whisper_prompt": answer if isinstance(answer, str) else answer.get("whisper_prompt", ""),
+    }
+
+
 def transcribe_audio(state: State):
     client = OpenAI()
     with open(state["audio_file"], "rb") as audio_file:
@@ -50,7 +62,7 @@ def transcribe_audio(state: State):
             response_format="text",
             file=audio_file,
             language="ko",
-            prompt="착륙성공,기압정상,온도,화성,첫발,공기",
+            prompt=state.get("whisper_prompt", ""),
         )
         return {
             "transcription": transcription,
@@ -224,6 +236,7 @@ def generate_hd_thumbnail(state: State):
 graph_builder = StateGraph(State)
 
 graph_builder.add_node("extract_audio", extract_audio)
+graph_builder.add_node("get_transcription_prompt", get_transcription_prompt)
 graph_builder.add_node("transcribe_audio", transcribe_audio)
 graph_builder.add_node("summarize_chunk", summarize_chunk)
 graph_builder.add_node("mega_summary", mega_summary)
@@ -232,7 +245,8 @@ graph_builder.add_node("human_feedback", human_feedback)
 graph_builder.add_node("generate_hd_thumbnail", generate_hd_thumbnail)
 
 graph_builder.add_edge(START, "extract_audio")
-graph_builder.add_edge("extract_audio", "transcribe_audio")
+graph_builder.add_edge("extract_audio", "get_transcription_prompt")
+graph_builder.add_edge("get_transcription_prompt", "transcribe_audio")
 graph_builder.add_conditional_edges(
     "transcribe_audio", dispatch_summarizers, ["summarize_chunk"]
 )
